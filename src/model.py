@@ -26,31 +26,121 @@ class CyclicNet(nn.Module):
     def __init__(
         self,
         bag_size: int = 15,
+        layer_sizes: Optional[Iterable[int]] = None,
+        layer_names: Optional[Iterable[str]] = None,
         steps: int = 5,
         anti_hebb_lambda: float = 1e-3,
         recurrent_sparsity: float = 0.9,
+        recurrent_groups: int = 1,
     ) -> None:
         super().__init__()
-        self.bag_size = bag_size
+        if layer_sizes is None:
+            layer_sizes_list = [int(bag_size)]
+        else:
+            layer_sizes_list = [int(s) for s in layer_sizes]
+        if not layer_sizes_list:
+            raise ValueError("layer_sizes must contain at least one layer size")
+        if any(s <= 0 for s in layer_sizes_list):
+            raise ValueError(f"All layer sizes must be > 0, got {layer_sizes_list}")
+        self.layer_sizes = layer_sizes_list
+        self.n_layers = len(self.layer_sizes)
+        if layer_names is None:
+            layer_names_list = [f"L{i+1}" for i in range(self.n_layers)]
+        else:
+            layer_names_list = [str(n) for n in layer_names]
+        if len(layer_names_list) != self.n_layers:
+            raise ValueError(
+                f"layer_names length ({len(layer_names_list)}) must match layer_sizes length ({self.n_layers})"
+            )
+        if len(set(layer_names_list)) != len(layer_names_list):
+            raise ValueError(f"layer_names must be unique, got {layer_names_list}")
+        if "I" in layer_names_list and layer_names_list.index("I") != 0:
+            raise ValueError("If provided, 'I' (input layer) must be the first layer")
+        self.layer_names = layer_names_list
+        self.action_layer_idx = (
+            layer_names_list.index("A") if "A" in layer_names_list else (self.n_layers - 1)
+        )
+        self.class_layer_idx = (
+            layer_names_list.index("C") if "C" in layer_names_list else (self.n_layers - 1)
+        )
+        # For backward compatibility, bag_size refers to the top layer width.
+        self.bag_size = int(self.layer_sizes[-1])
         self.steps = steps
         self.anti_hebb_lambda = anti_hebb_lambda
         self.recurrent_sparsity = recurrent_sparsity
+        self.recurrent_groups = int(recurrent_groups)
+        if self.recurrent_groups < 1:
+            raise ValueError(f"recurrent_groups must be >= 1, got {self.recurrent_groups}")
+        if self.recurrent_groups > 1:
+            for s in self.layer_sizes:
+                if s % self.recurrent_groups != 0:
+                    raise ValueError(
+                        f"layer size ({s}) must be divisible by recurrent_groups ({self.recurrent_groups})"
+                    )
+            self._block_sizes = [s // self.recurrent_groups for s in self.layer_sizes]
+        else:
+            self._block_sizes = []
         self.patch_size = 8
         self.image_size = 28
         self.start_row = (self.image_size - self.patch_size) // 2
         self.start_col = (self.image_size - self.patch_size) // 2
 
         # Patch pixels + (row, col) location of the context window.
-        self.input_proj = nn.Linear(self.patch_size * self.patch_size + 2, bag_size)
-        self.state_norm = nn.LayerNorm(bag_size)
-        self.recurrent = nn.Parameter(torch.empty(bag_size, bag_size))
-        self.recurrent_bias = nn.Parameter(torch.zeros(bag_size))
-        # Fixed recurrent connectivity mask (1 = active connection, 0 = masked).
-        keep_prob = max(0.0, min(1.0, 1.0 - float(recurrent_sparsity)))
-        mask = (torch.rand(bag_size, bag_size) < keep_prob).to(torch.float32)
-        self.register_buffer("recurrent_mask", mask)
-        self.controller = nn.Linear(bag_size, 2)
-        self.out_proj = nn.Linear(bag_size, 10)
+        self.input_proj = nn.Linear(self.patch_size * self.patch_size + 2, self.layer_sizes[0])
+        self._ff_sources: list[list[int]] = [[] for _ in range(self.n_layers)]
+        self.ff_projs = nn.ModuleDict()
+        # Default: simple chain i -> i+1
+        for i in range(self.n_layers - 1):
+            j = i + 1
+            self._ff_sources[j].append(i)
+            self.ff_projs[f"{i}_{j}"] = nn.Linear(self.layer_sizes[i], self.layer_sizes[j])
+
+        # Special case: if both A and C are present, and there is an M* layer before them,
+        # feed both A and C from the last M* layer (1-step delayed), rather than chaining.
+        if "A" in layer_names_list and "C" in layer_names_list:
+            a_idx = self.action_layer_idx
+            c_idx = self.class_layer_idx
+            m_candidates = [
+                i
+                for i, nm in enumerate(layer_names_list)
+                if nm.upper().startswith("M") and i < a_idx and i < c_idx
+            ]
+            if m_candidates:
+                m_idx = max(m_candidates)
+                for dst in (a_idx, c_idx):
+                    if dst != 0:
+                        self._ff_sources[dst] = [m_idx]
+                        key = f"{m_idx}_{dst}"
+                        if key not in self.ff_projs:
+                            self.ff_projs[key] = nn.Linear(self.layer_sizes[m_idx], self.layer_sizes[dst])
+
+        self.state_norms = nn.ModuleList([nn.LayerNorm(s) for s in self.layer_sizes])
+        if self.recurrent_groups == 1:
+            self.recurrents = nn.ParameterList(
+                [nn.Parameter(torch.empty(s, s)) for s in self.layer_sizes]
+            )
+            self.recurrent_biases = nn.ParameterList(
+                [nn.Parameter(torch.zeros(s)) for s in self.layer_sizes]
+            )
+            # Fixed recurrent connectivity mask (1 = active connection, 0 = masked).
+            keep_prob = max(0.0, min(1.0, 1.0 - float(recurrent_sparsity)))
+            for i, s in enumerate(self.layer_sizes):
+                mask = (torch.rand(s, s) < keep_prob).to(torch.float32)
+                self.register_buffer(f"recurrent_mask_{i}", mask)
+        else:
+            # Block-diagonal recurrence: recurrent weight is represented as G independent blocks.
+            # This enables compute proportional to 1/G using dense matmuls (GPU-friendly).
+            self.recurrent_blocks_list = nn.ParameterList(
+                [
+                    nn.Parameter(torch.empty(self.recurrent_groups, bs, bs))
+                    for bs in self._block_sizes
+                ]
+            )
+            self.recurrent_biases = nn.ParameterList(
+                [nn.Parameter(torch.zeros(self.recurrent_groups, bs)) for bs in self._block_sizes]
+            )
+        self.controller = nn.Linear(self.layer_sizes[self.action_layer_idx], 2)
+        self.out_proj = nn.Linear(self.layer_sizes[self.class_layer_idx], 10)
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -58,11 +148,23 @@ class CyclicNet(nn.Module):
         init.kaiming_normal_(self.input_proj.weight, nonlinearity="relu")
         init.zeros_(self.input_proj.bias)
 
-        init.kaiming_normal_(self.recurrent, nonlinearity="relu")
-        # Respect fixed connectivity from the start.
-        with torch.no_grad():
-            self.recurrent.mul_(self.recurrent_mask)
-        init.zeros_(self.recurrent_bias)
+        if self.recurrent_groups == 1:
+            for i, w in enumerate(self.recurrents):
+                init.kaiming_normal_(w, nonlinearity="relu")
+                # Respect fixed connectivity from the start.
+                with torch.no_grad():
+                    w.mul_(getattr(self, f"recurrent_mask_{i}"))
+            for b in self.recurrent_biases:
+                init.zeros_(b)
+        else:
+            for w in self.recurrent_blocks_list:
+                init.kaiming_normal_(w, nonlinearity="relu")
+            for b in self.recurrent_biases:
+                init.zeros_(b)
+
+        for _, proj in self.ff_projs.items():
+            init.kaiming_normal_(proj.weight, nonlinearity="relu")
+            init.zeros_(proj.bias)
 
         init.kaiming_normal_(self.controller.weight, nonlinearity="relu")
         init.zeros_(self.controller.bias)
@@ -79,23 +181,36 @@ class CyclicNet(nn.Module):
         logits_series, _, _ = self._rollout(
             x, steps_override=None, record_positions=False, start_positions=start_positions
         )
-        return logits_series if return_all else logits_series[-1]
+        if return_all:
+            return logits_series
+
+        # Aggregate across time by "most present" prediction:
+        # take the per-step argmax class, mode across time, then average logits
+        # over the timesteps that predicted that mode class.
+        logits_t = torch.stack(logits_series, dim=0)  # [T, B, 10]
+        preds_t = logits_t.argmax(dim=-1)  # [T, B]
+        mode_pred = preds_t.mode(dim=0).values  # [B]
+        mask = preds_t.eq(mode_pred.unsqueeze(0)).to(logits_t.dtype)  # [T, B]
+        denom = mask.sum(dim=0).clamp(min=1.0)  # [B]
+        agg = (logits_t * mask.unsqueeze(-1)).sum(dim=0) / denom.unsqueeze(-1)  # [B, 10]
+        return agg
 
     def _compute_move(self, ctrl: torch.Tensor) -> torch.Tensor:
         """
-        Convert controller outputs to integer moves (up/down/left/right).
-        Chooses the axis with larger magnitude; step is sign {-1, 0, 1}.
-        """
-        mag_row = ctrl[:, 0].abs()
-        mag_col = ctrl[:, 1].abs()
-        row_mask = mag_row >= mag_col
+        Convert controller outputs to integer moves (row, col).
 
-        row_move = torch.where(
-            row_mask, torch.sign(ctrl[:, 0]).to(torch.int64), torch.zeros_like(ctrl[:, 0], dtype=torch.int64)
-        )
-        col_move = torch.where(
-            row_mask, torch.zeros_like(ctrl[:, 1], dtype=torch.int64), torch.sign(ctrl[:, 1]).to(torch.int64)
-        )
+        Each controller component is assumed to be in [-1, 1] (e.g. tanh output) and
+        is mapped to an integer jump size up to the full valid coordinate range.
+        Small magnitudes floor to 0 (no-op).
+        """
+        max_jump = int(self.image_size - self.patch_size)
+        scale = float(max_jump + 1)
+
+        # floor(|ctrl| * (max_jump+1)) gives 0 for small values and max_jump for ctrl≈±1.
+        row_steps = torch.floor(ctrl[:, 0].abs() * scale).clamp(max=max_jump).to(torch.int64)
+        col_steps = torch.floor(ctrl[:, 1].abs() * scale).clamp(max=max_jump).to(torch.int64)
+        row_move = torch.sign(ctrl[:, 0]).to(torch.int64) * row_steps
+        col_move = torch.sign(ctrl[:, 1]).to(torch.int64) * col_steps
         return torch.stack([row_move, col_move], dim=1)
 
     def _rollout(
@@ -136,7 +251,7 @@ class CyclicNet(nn.Module):
         positions_hist = [] if record_positions else None
         states_hist = [] if record_states else None
 
-        state = None
+        states: list[Optional[torch.Tensor]] = [None for _ in range(self.n_layers)]
         logits_series = []
         for _ in range(steps):
             # Select patches via unfold + gather to stay vmap-friendly
@@ -150,25 +265,82 @@ class CyclicNet(nn.Module):
             pos = (positions.to(flat.dtype) / float(denom)) * 2.0 - 1.0  # [B, 2]
             in_act = self.input_proj(torch.cat([flat, pos], dim=1))
 
-            if state is None:
-                state = self.state_norm(F.relu(in_act))
-            else:
-                # Anti-hebbian decay within the bag: reduce connections for co-active pairs.
-                coact = torch.einsum("bi,bj->ij", state, state) / max(B, 1)
-                recurrent_eff = (self.recurrent - self.anti_hebb_lambda * coact) * self.recurrent_mask
-                state = self.state_norm(
-                    F.relu(in_act + F.linear(state, recurrent_eff, self.recurrent_bias))
-                )
+            prev_states = states
+            new_states: list[Optional[torch.Tensor]] = [None for _ in range(self.n_layers)]
 
-            logits = self.out_proj(state)
+            # Layer 0 consumes the external input each step.
+            if prev_states[0] is None:
+                new_states[0] = self.state_norms[0](F.relu(in_act))
+            else:
+                if self.recurrent_groups == 1:
+                    recurrent_eff = self.recurrents[0] * getattr(self, "recurrent_mask_0")
+                    rec = F.linear(prev_states[0], recurrent_eff, self.recurrent_biases[0])
+                else:
+                    bs = self._block_sizes[0]
+                    st = prev_states[0].view(B, self.recurrent_groups, bs)
+                    rec = torch.einsum("bgs,gsh->bgh", st, self.recurrent_blocks_list[0])
+                    rec = rec + self.recurrent_biases[0]
+                    rec = rec.reshape(B, self.layer_sizes[0])
+                new_states[0] = self.state_norms[0](F.relu(in_act + rec))
+
+            # Higher layers: receive input only from their feedforward sources with a 1-step delay.
+            for li in range(1, self.n_layers):
+                if prev_states[li] is None and all(prev_states[s] is None for s in self._ff_sources[li]):
+                    new_states[li] = None
+                    continue
+                in_terms = []
+                for src in self._ff_sources[li]:
+                    st = prev_states[src]
+                    if st is None:
+                        continue
+                    in_terms.append(self.ff_projs[f"{src}_{li}"](st))
+                in_act_li = sum(in_terms) if in_terms else None
+
+                if prev_states[li] is None:
+                    if in_act_li is None:
+                        new_states[li] = None
+                    else:
+                        new_states[li] = self.state_norms[li](F.relu(in_act_li))
+                else:
+                    if in_act_li is None:
+                        # No feedforward input this step; only recurrent update.
+                        in_act_li = torch.zeros_like(prev_states[li])
+                    if self.recurrent_groups == 1:
+                        recurrent_eff = self.recurrents[li] * getattr(self, f"recurrent_mask_{li}")
+                        rec = F.linear(prev_states[li], recurrent_eff, self.recurrent_biases[li])
+                    else:
+                        bs = self._block_sizes[li]
+                        st = prev_states[li].view(B, self.recurrent_groups, bs)
+                        rec = torch.einsum("bgs,gsh->bgh", st, self.recurrent_blocks_list[li])
+                        rec = rec + self.recurrent_biases[li]
+                        rec = rec.reshape(B, self.layer_sizes[li])
+                    new_states[li] = self.state_norms[li](F.relu(in_act_li + rec))
+
+            states = new_states
+            class_state = states[self.class_layer_idx]
+            if class_state is None:
+                class_state_for_readout = torch.zeros(
+                    B,
+                    self.layer_sizes[self.class_layer_idx],
+                    device=device,
+                    dtype=in_act.dtype,
+                )
+            else:
+                class_state_for_readout = class_state
+
+            logits = self.out_proj(class_state_for_readout)
             logits_series.append(logits)
             if record_positions:
                 positions_hist.append(positions.detach().cpu())
             if record_states:
-                states_hist.append(state.detach().cpu())
+                states_hist.append(class_state_for_readout.detach().cpu())
 
-            ctrl = torch.tanh(self.controller(state))
-            move = self._compute_move(ctrl)
+            action_state = states[self.action_layer_idx]
+            if action_state is None:
+                move = torch.zeros(B, 2, device=device, dtype=torch.int64)
+            else:
+                ctrl = torch.tanh(self.controller(action_state))
+                move = self._compute_move(ctrl)
             positions = positions + move
             positions = positions.clamp(0, self.image_size - self.patch_size)
 
@@ -180,6 +352,8 @@ class ESConfig:
     npop: int = 250
     sigma: float = 0.1
     alpha: float = 1e-2
+    weight_decay: float = 0.0
+    amp: bool = False
 
 
 class EvolutionStrategyCNN:
@@ -198,9 +372,12 @@ class EvolutionStrategyCNN:
         *,
         eval_devices: Optional[Tuple[torch.device, ...]] = None,
         bag_size: int = 15,
+        layer_sizes: Optional[Iterable[int]] = None,
+        layer_names: Optional[Iterable[str]] = None,
         steps: int = 5,
         anti_hebb_lambda: float = 1e-3,
         recurrent_sparsity: float = 0.9,
+        recurrent_groups: int = 1,
     ) -> None:
         self.config = config
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -208,9 +385,12 @@ class EvolutionStrategyCNN:
 
         self.model = CyclicNet(
             bag_size=bag_size,
+            layer_sizes=layer_sizes,
+            layer_names=layer_names,
             steps=steps,
             anti_hebb_lambda=anti_hebb_lambda,
             recurrent_sparsity=recurrent_sparsity,
+            recurrent_groups=recurrent_groups,
         ).to(self.device)
         self._w = parameters_to_vector(self.model.parameters()).detach()
         self._param_shapes = [
@@ -281,7 +461,9 @@ class EvolutionStrategyCNN:
                 loss = F.cross_entropy(logits, targets, reduction="mean")
                 return -loss
 
-            return vmap(single_reward)(vectors)
+            use_amp = bool(self.config.amp) and self.device.type == "cuda"
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                return vmap(single_reward)(vectors)
 
         inputs_cpu, targets_cpu = batch
         pop = vectors.shape[0]
@@ -313,7 +495,9 @@ class EvolutionStrategyCNN:
                 loss = F.cross_entropy(logits, dev_targets, reduction="mean")
                 return -loss
 
-            r = vmap(single_reward)(dev_vecs)
+            use_amp = bool(self.config.amp) and dev_inputs.device.type == "cuda"
+            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+                r = vmap(single_reward)(dev_vecs)
             rewards_parts.append(r.to(self.device, non_blocking=True))
 
         rewards = torch.cat(rewards_parts, dim=0)
@@ -348,7 +532,10 @@ class EvolutionStrategyCNN:
 
         # ES parameter update
         step_dir = (A.unsqueeze(1) * noise).mean(dim=0)
-        delta = (cfg.alpha / cfg.sigma) * step_dir
+        delta_es = (cfg.alpha / cfg.sigma) * step_dir
+        # L2 weight decay (SGD-style): w <- w + delta_es - alpha*wd*w
+        # (keeps weight norms from drifting upwards unchecked)
+        delta = delta_es - (cfg.alpha * cfg.weight_decay) * w
         w = w + delta
 
         self._w = w
@@ -382,6 +569,7 @@ class EvolutionStrategyCNN:
                 "reward_min": float(rewards.min().item()),
                 "reward_med": float(rewards.median().item()),
                 "reward_max": float(rewards.max().item()),
+                "weight_norm": float(w_norm.item()),
                 "delta_norm": float(delta_norm.item()),
                 "delta_rel": float((delta_norm / (w_norm + 1e-12)).item()),
                 "step_dir_norm": float(step_dir_norm.item()),

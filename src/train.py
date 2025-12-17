@@ -345,6 +345,48 @@ def save_prob_lines_gif(
 
 
 @torch.no_grad()
+def save_timestep_accuracy_plot(
+    es: EvolutionStrategyCNN,
+    loader,
+    out_path: Path,
+) -> None:
+    """
+    Plot validation accuracy at each recurrent time step, averaged over the dataset.
+    """
+    es.model.eval()
+    steps = es.model.steps
+
+    # Accumulators: correct[t] and total counts
+    correct_per_step = [0] * steps
+    total = 0
+
+    for images, labels in loader:
+        images = images.to(es.device, non_blocking=True)
+        labels = labels.to(es.device, non_blocking=True)
+        # Get logits at all time steps
+        logits_series = es.model(images, return_all=True)  # list of [B, 10]
+        for t, logits in enumerate(logits_series):
+            preds = logits.argmax(dim=1)
+            correct_per_step[t] += (preds == labels).sum().item()
+        total += labels.numel()
+
+    acc_per_step = [100.0 * c / max(total, 1) for c in correct_per_step]
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(range(1, steps + 1), acc_per_step, marker="o", linewidth=2)
+    ax.set_xlabel("Time Step")
+    ax.set_ylabel("Validation Accuracy (%)")
+    ax.set_title("Accuracy vs. Recurrent Time Step")
+    ax.set_xticks(range(1, steps + 1))
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    out_path.parent.mkdir(exist_ok=True)
+    plt.savefig(out_path)
+    plt.close(fig)
+
+
+@torch.no_grad()
 def save_activation_pca_gif(
     es: EvolutionStrategyCNN,
     images: torch.Tensor,
@@ -443,11 +485,16 @@ def train(
     num_workers: int = 8,
     time_steps: int = 5,
     bag_size: int = 15,
+    layer_sizes: list[int] | None = None,
+    layer_names: list[str] | None = None,
     recurrent_sparsity: float = 0.9,
+    recurrent_groups: int = 1,
     devices: str = "cuda:0",
     npop: int = ESConfig.npop,
     sigma: float = ESConfig.sigma,
     alpha: float = ESConfig.alpha,
+    weight_decay: float = ESConfig.weight_decay,
+    amp: bool = ESConfig.amp,
 ) -> EvolutionStrategyCNN:
     """
     Run ES training over MNIST using a single GPU if available.
@@ -470,17 +517,35 @@ def train(
         batch_size=batch_size, num_workers=num_workers
     )
 
-    es_config = ESConfig(npop=npop, sigma=sigma, alpha=alpha)
+    es_config = ESConfig(npop=npop, sigma=sigma, alpha=alpha, weight_decay=weight_decay, amp=amp)
     es = EvolutionStrategyCNN(
         config=es_config,
         device=device,
         eval_devices=eval_devices,
         steps=time_steps,
         bag_size=bag_size,
+        layer_sizes=layer_sizes,
+        layer_names=layer_names,
         recurrent_sparsity=recurrent_sparsity,
+        recurrent_groups=recurrent_groups,
     )
     viz_batch = None
     test_batch = None
+
+    print(f"\n{'='*60}")
+    print("Starting Training")
+    print(f"{'='*60}")
+    if layer_sizes is None:
+        print(f"Config: steps={time_steps}, bag_size={bag_size}, sparsity={recurrent_sparsity:.1%}")
+    else:
+        if layer_names is None:
+            print(f"Config: steps={time_steps}, arch={layer_sizes}, sparsity={recurrent_sparsity:.1%}")
+        else:
+            arch_str = ",".join(f"{n}:{s}" for n, s in zip(layer_names, layer_sizes))
+            print(f"Config: steps={time_steps}, arch={arch_str}, sparsity={recurrent_sparsity:.1%}")
+    print(f"ES: npop={npop}, σ={sigma:.3f}, α={alpha:.4f}")
+    print(f"Device: {device}")
+    print(f"{'='*60}\n")
 
     for epoch in range(1, num_epochs + 1):
         rewards = []
@@ -499,53 +564,49 @@ def train(
                 avg = sum(rewards[-50:]) / len(rewards[-50:])
                 m = getattr(es, "last_step_metrics", {}) or {}
                 print(
-                    "[epoch {epoch} step {step}] "
-                    "reward_avg={avg:.4f} "
-                    "pop(mean/std/min/med/max)={rmean:.4f}/{rstd:.4f}/{rmin:.4f}/{rmed:.4f}/{rmax:.4f} "
-                    "delta_norm={dn:.3e} delta_rel={dr:.3e} "
-                    "step_dir_norm={sdn:.3e} snr_corr={sc:.3f} cos_prev={cp:.3f}".format(
-                        epoch=epoch,
-                        step=step,
-                        avg=avg,
-                        rmean=m.get("reward_mean", float("nan")),
-                        rstd=m.get("reward_std", float("nan")),
-                        rmin=m.get("reward_min", float("nan")),
-                        rmed=m.get("reward_med", float("nan")),
-                        rmax=m.get("reward_max", float("nan")),
-                        dn=m.get("delta_norm", float("nan")),
-                        dr=m.get("delta_rel", float("nan")),
-                        sdn=m.get("step_dir_norm", float("nan")),
-                        sc=m.get("snr_corr", float("nan")),
-                        cp=m.get("delta_cos_prev", float("nan")),
-                    )
+                    f"\n[Epoch {epoch:2d} | Step {step:4d}] "
+                    f"Reward: {avg:.4f} (pop: μ={m.get('reward_mean', float('nan')):.4f}, "
+                    f"σ={m.get('reward_std', float('nan')):.4f}, "
+                    f"range=[{m.get('reward_min', float('nan')):.4f}, {m.get('reward_max', float('nan')):.4f}])"
+                )
+                print(
+                    f"  Update: |Δ|={m.get('delta_norm', float('nan')):.3e} "
+                    f"({m.get('delta_rel', float('nan')):.2%}), "
+                    f"|w|={m.get('weight_norm', float('nan')):.3e}"
                 )
 
             if steps_per_epoch and step >= steps_per_epoch:
                 break
 
         epoch_avg = sum(rewards) / len(rewards)
-        print(f"Epoch {epoch} complete: mean_reward={epoch_avg:.4f}")
-
         val_acc = evaluate_accuracy(es, test_loader)
-        print(f"Validation accuracy: {val_acc:.2f}%")
+        print(f"\n{'='*60}")
+        print(f"Epoch {epoch}/{num_epochs} Complete")
+        print(f"  Mean Reward: {epoch_avg:.4f}")
+        print(f"  Validation Accuracy: {val_acc:.2f}%")
+        print(f"{'='*60}\n")
 
-        if viz_batch is not None:
-            project_root = Path(__file__).resolve().parent.parent
-            out_dir = project_root / "imgs"
-            out_dir.mkdir(exist_ok=True)
-            out_path = out_dir / f"epoch_{epoch:03d}.png"
-            save_prediction_grid(es, viz_batch, out_path)
-            print(f"Saved prediction grid to {out_path}")
+    # End-of-training visualizations
+    project_root = Path(__file__).resolve().parent.parent
+    out_dir = project_root / "imgs"
+    out_dir.mkdir(exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print("Generating Visualizations...")
+    print(f"{'='*60}")
+
+    if viz_batch is not None:
+        out_path = out_dir / "predictions.png"
+        save_prediction_grid(es, viz_batch, out_path)
+        print(f"  ✓ Predictions grid: {out_path.name}")
 
     if test_batch is not None:
-        project_root = Path(__file__).resolve().parent.parent
-        out_dir = project_root / "imgs"
-        out_dir.mkdir(exist_ok=True)
         imgs = test_batch[0].cpu()
         lbls = test_batch[1].cpu()
+
         gif_path = out_dir / "dynamics.gif"
         save_dynamics_gif(es, imgs[0], gif_path)
-        print(f"Saved dynamics GIF to {gif_path}")
+        print(f"  ✓ Dynamics GIF: {gif_path.name}")
 
         attn_gif_path = out_dir / "attention.gif"
         # Build a 10x10 collage: column = digit (0..9), 10 samples per digit from val set.
@@ -567,7 +628,7 @@ def train(
         attn_imgs = torch.stack(ordered, dim=0)
 
         save_attention_gif(es, attn_imgs, attn_gif_path, steps=time_steps, grid_dim=10)
-        print(f"Saved attention GIF to {attn_gif_path}")
+        print(f"  ✓ Attention GIF: {attn_gif_path.name}")
 
         # Probability trajectories with digit switches
         num_seq = min(4, imgs.shape[0])
@@ -576,16 +637,50 @@ def train(
         seq_lbls = lbls[idx]
         line_gif_path = out_dir / "dynamics_probs.gif"
         save_prob_lines_gif(es, seq_imgs, seq_lbls, line_gif_path, steps_per_digit=6)
-        print(f"Saved probability dynamics GIF to {line_gif_path}")
+        print(f"  ✓ Probability dynamics GIF: {line_gif_path.name}")
 
         pca_gif_path = out_dir / "pca_activations.gif"
         save_activation_pca_gif(es, imgs, lbls, pca_gif_path, steps=time_steps, max_points=256)
-        print(f"Saved activation PCA GIF to {pca_gif_path}")
+        print(f"  ✓ Activation PCA GIF: {pca_gif_path.name}")
+
+        timestep_acc_path = out_dir / "timestep_accuracy.png"
+        save_timestep_accuracy_plot(es, test_loader, timestep_acc_path)
+        print(f"  ✓ Timestep accuracy plot: {timestep_acc_path.name}")
+
+    print(f"{'='*60}\n")
 
     return es
 
 
 if __name__ == "__main__":
+    def _parse_arch(spec: str) -> tuple[list[str], list[int]]:
+        parts = [p.strip() for p in (spec or "").split(",") if p.strip()]
+        if not parts:
+            raise ValueError("arch must be non-empty (e.g. L1:16,L2:8)")
+        names: list[str] = []
+        sizes: list[int] = []
+        for i, p in enumerate(parts):
+            if ":" in p:
+                lhs, rhs = p.split(":", 1)
+                name = lhs.strip()
+                rhs = rhs.strip()
+                if not name:
+                    raise ValueError(f"Invalid arch token '{p}' (empty name before ':')")
+            else:
+                name = f"L{i+1}"
+                rhs = p
+            try:
+                v = int(rhs)
+            except ValueError as e:
+                raise ValueError(f"Invalid arch token '{p}' (expected like L1:16)") from e
+            if v <= 0:
+                raise ValueError(f"Layer sizes must be > 0, got {v} in '{p}'")
+            names.append(name)
+            sizes.append(v)
+        if len(set(names)) != len(names):
+            raise ValueError(f"Layer names must be unique, got {names}")
+        return names, sizes
+
     parser = argparse.ArgumentParser(description="Train ES CyclicNet on MNIST.")
     parser.add_argument("--epochs", type=int, default=10, help="Number of training epochs.")
     parser.add_argument(
@@ -595,6 +690,12 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader workers.")
     parser.add_argument("--time-steps", type=int, default=5, help="Recurrent time steps for CyclicNet.")
     parser.add_argument("--bag-size", type=int, default=15, help="Number of neurons in the bag.")
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default=None,
+        help="Stacked recurrent architecture, e.g. 'L1:16,L2:8,L3:8'. If set, overrides --bag-size for the hidden stack.",
+    )
     parser.add_argument(
         "--devices",
         type=str,
@@ -607,10 +708,31 @@ if __name__ == "__main__":
         default=0.9,
         help="Fraction of recurrent connections masked out (e.g. 0.9 keeps ~10%).",
     )
+    parser.add_argument(
+        "--recurrent-groups",
+        type=int,
+        default=1,
+        help="If >1, use block-diagonal recurrence with this many equal-size groups (bag-size must be divisible).",
+    )
     parser.add_argument("--npop", type=int, default=ESConfig.npop, help="ES population size.")
     parser.add_argument("--sigma", type=float, default=ESConfig.sigma, help="ES noise std.")
     parser.add_argument("--alpha", type=float, default=ESConfig.alpha, help="ES learning rate.")
+    parser.add_argument(
+        "--weight-decay",
+        type=float,
+        default=ESConfig.weight_decay,
+        help="L2 weight decay coefficient applied to the ES parameter vector (0 disables).",
+    )
+    parser.add_argument(
+        "--amp",
+        action="store_true",
+        help="Enable CUDA AMP (FP16 autocast) for population forward passes.",
+    )
     args = parser.parse_args()
+    if args.arch:
+        layer_names, layer_sizes = _parse_arch(args.arch)
+    else:
+        layer_names, layer_sizes = None, None
 
     train(
         num_epochs=args.epochs,
@@ -619,10 +741,15 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         time_steps=args.time_steps,
         bag_size=args.bag_size,
+        layer_sizes=layer_sizes,
+        layer_names=layer_names,
         recurrent_sparsity=args.recurrent_sparsity,
+        recurrent_groups=args.recurrent_groups,
         devices=args.devices,
         npop=args.npop,
         sigma=args.sigma,
         alpha=args.alpha,
+        weight_decay=args.weight_decay,
+        amp=args.amp,
     )
 
